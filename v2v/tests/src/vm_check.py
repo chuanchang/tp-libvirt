@@ -1,7 +1,8 @@
 import re
 import logging
+import commands
+from virttest import utils_v2v, virsh
 from autotest.client.shared import error
-from virttest import utils_v2v
 
 
 def run(test, params, env):
@@ -9,6 +10,13 @@ def run(test, params, env):
     Check VM after conversion
     """
     target = params.get('target')
+    hypervisor = params.get('hypervisor')
+    hostname = params.get('hostname')
+    vpx_dc = params.get('vpx_dc')
+    esx_ip = params.get('esx_ip')
+    vm_name = params.get('main_vm')
+    remote_ip = params.get('')
+    remote_pwd = params.get('')
 
     check_obj = utils_v2v.VMCheck(test, params, env)
 
@@ -94,12 +102,62 @@ def run(test, params, env):
         else:
             logging.info("SUCCESS")
 
+        uri = None
+        uri_obj = utils_v2v.Uri(hypervisor)
+        if hypervisor == "kvm":
+            uri = "qemu+ssh://%s/system" % hostname
+        else:
+            uri = uri_obj.get_uri(hostname, vpx_dc, esx_ip)
+
+        video_model = ""
+        if hypervisor == 'kvm':
+            # dump VM XML
+            cmd = "virsh dumpxml %s |grep -A 3 '<video>'" % vm_name
+            status, output = commands.getstatusoutput(cmd)
+            # get remote session
+            if status:
+                raise error.TestError(vm_name, output)
+
+            video_type = re.search("type='[a-z]*'", output)
+            if video_type:
+                video_model = eval(video_type.group(0).split('=')[1])
+
         logging.info("Check video")
         video = check_obj.get_vm_video()
-        if not re.search('el6', kernel_version):
-            if re.search('cirrus', video):
+        if target == 'ovirt':
+            if re.search('qxl', video):
                 logging.info("SUCCESS")
             else:
                 raise error.TestFail("FAIL")
+        else:
+            if re.search('el7', kernel_version):
+                if 'cirrus' in output:
+                    if re.search('kms', video):
+                        logging.info("SUCCESS")
+                    else:
+                        raise error.TestFail("FAIL")
+                else:
+                    if re.search(video_model, video):
+                        logging.info("SUCCESS")
+                    else:
+                        raise error.TestFail("FAIL")
+            else:
+                if re.search(video_model, video):
+                    logging.info("SUCCESS")
+                else:
+                    raise error.TestFail("FAIL")
+
+        logging.info("Check device mapping")
+        dev_map = ""
+        if re.search('el7', kernel_version):
+            dev_map = '/boot/grub2/device.map'
+        else:
+            dev_map = '/boot/grub/device.map'
+
+        if check_obj.get_grub_device(dev_map):
+            logging.info("SUCCESS")
+        else:
+            raise error.TestFail("FAIL")
+
     finally:
         del check_obj

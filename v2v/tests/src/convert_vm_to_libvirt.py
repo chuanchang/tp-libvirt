@@ -1,10 +1,10 @@
 import os
 import logging
 import re
-from autotest.client import lv_utils
+from autotest.client import lv_utils, utils
 from autotest.client.shared import ssh_key, error
 from virttest import utils_v2v, libvirt_storage, libvirt_vm, virsh
-from virttest import virt_vm, remote, data_dir
+from virttest import virt_vm, remote, data_dir, utils_misc
 from virttest.utils_test import libvirt as utlv
 
 
@@ -31,28 +31,6 @@ def create_dir_pool(spool, pool_name, target_path):
     return True
 
 
-def prepare_remote_sp(rsp, rvm, pool_name="v2v_test"):
-    """
-    v2v need remote vm's disk stored in a pool.
-
-    :param rsp: remote storage pool's instance
-    :param rvm: remote vm instance
-    """
-    # Get remote vms' disk path
-    disks = rvm.get_disk_devices()
-    target_path = ''
-    for target in ['hda', 'sda', 'vda', 'xvda']:
-        try:
-            target_path = disks[target]["source"]
-            logging.debug("System Disk:%s", target_path)
-            target_path = os.path.dirname(target_path)
-        except KeyError:
-            continue
-    if target_path:
-        return create_dir_pool(rsp, pool_name, target_path)
-    return False
-
-
 def cleanup_vm(vm_name=None, disk=None):
     """
     Cleanup the vm with its disk deleted.
@@ -75,14 +53,18 @@ def run(test, params, env):
     """
     # VM info
     xen_vm_name = params.get("v2v_xen_vm")
-    vmware_vm_name = params.get("v2v_vmware_vm")
+    esx_vm_name = params.get("v2v_esx_vm")
 
     # Remote host parameters
     xen_ip = params.get("remote_xen_ip", "XEN.EXAMPLE")
-    vmware_ip = params.get("remote_vmware_ip", "VMWARE.EXAMPLE")
+    vpx_ip = params.get("remote_vpx_ip", "ESX.EXAMPLE")
     username = params.get("username", "root")
     xen_pwd = params.get("remote_xen_pwd", "PWD.EXAMPLE")
-    vmware_pwd = params.get("remote_vmware_pwd", "PWD.EXAMPLE")
+    vpx_pwd = params.get("remote_vpx_pwd", "PWD.EXAMPLE")
+    vpx_user = params.get("vpx_user", "root")
+    vpx_pwd_file = params.get("vpx_passwd_file")
+    vpx_dc = params.get("remote_vpx_dc", "VPX.DC.EXAMPLE")
+    esx_ip = params.get("remote_esx_ip", "ESX.EXAMPLE")
     # To decide which type test it is
     remote_hypervisor = params.get("remote_hypervisor")
 
@@ -94,7 +76,7 @@ def run(test, params, env):
     emulated_size = params.get("emulated_image_size", "10G")
 
     # If target_path is not an abs path, join it to data_dir.tmpdir
-    if os.path.dirname(target_path) is "":
+    if not os.path.dirname(target_path):
         target_path = os.path.join(data_dir.get_tmp_dir(), target_path)
 
     # V2V parameters
@@ -106,31 +88,46 @@ def run(test, params, env):
     # Result check about
     ignore_virtio = "yes" == params.get("ignore_virtio", "no")
 
-    # Create autologin to remote host
-    esx_netrc = params.get("esx_netrc") % (vmware_ip, username, vmware_pwd)
-    params['netrc'] = esx_netrc
+    # Set libguestfs environment
+    os.environ['LIBGUESTFS_BACKEND'] = 'direct'
+
+    # Extra v2v command options, default to None
+    v2v_options = params.get("v2v_options")
+
     if remote_hypervisor == "esx":
-        remote_ip = vmware_ip
-        remote_pwd = vmware_pwd
-        vm_name = vmware_vm_name
+        remote_ip = vpx_ip
+        remote_pwd = vpx_pwd
+        vm_name = esx_vm_name
         if remote_ip.count("EXAMPLE") or remote_pwd.count("EXAMPLE"):
             raise error.TestNAError("Please provide host or password for "
-                                    "vmware test.")
-        utils_v2v.build_esx_no_verify(params)
-    else:
-        remote_ip = xen_ip
-        remote_pwd = xen_pwd
-        vm_name = xen_vm_name
+                                    "ESX test.")
+        logging.info("Building ESX no password interactive verification.")
+        fp = open(vpx_pwd_file, 'w')
+        fp.write(vpx_pwd)
+        fp.close()
+
+    if remote_hypervisor == "xen" or remote_hypervisor == 'kvm':
+        remote_ip = params.get("remote_ip", xen_ip)
+        remote_pwd = params.get("remote_pwd", xen_pwd)
+        vm_name = params.get("vm_name", xen_vm_name)
         if remote_ip.count("EXAMPLE") or remote_pwd.count("EXAMPLE"):
             raise error.TestNAError("Please provide host or password for "
                                     "xen test.")
         ssh_key.setup_ssh_key(xen_ip, user=username, port=22,
                               password=xen_pwd)
+        # Note that password-interactive and Kerberos access are not supported.
+        # You have to set up ssh access using ssh-agent and authorized_keys.
+        try:
+            utils_misc.add_identities_into_ssh_agent()
+        except:
+            utils.run("ssh-agent -k")
+            raise error.TestFail("Failed to start 'ssh-agent'")
 
     # Create remote uri for remote host
     # Remote virt-v2v uri's instance
     ruri = utils_v2v.Uri(remote_hypervisor)
-    remote_uri = ruri.get_uri(remote_ip)
+    remote_uri = ruri.get_uri(remote_ip, vpx_dc, esx_ip)
+    logging.debug("The current virsh uri: [%s]", remote_uri)
 
     # Check remote vms
     rvirsh_dargs = {'uri': remote_uri, 'remote_ip': remote_ip,
@@ -141,14 +138,13 @@ def run(test, params, env):
         raise error.TestFail("Couldn't find vm '%s' to be converted "
                              "on remote uri '%s'." % (vm_name, remote_uri))
 
-    if remote_hypervisor != "esx":
-        remote_vm = libvirt_vm.VM(vm_name, params, test.bindir,
-                                  env.get("address_cache"))
-        remote_vm.connect_uri = remote_uri
-        # Remote storage pool's instance
-        rsp = libvirt_storage.StoragePool(rvirsh)
-        # Put remote vm's disk into a directory storage pool
-        prepare_remote_sp(rsp, remote_vm, pool_name)
+    remote_vm = libvirt_vm.VM(vm_name, params, test.bindir,
+                              env.get("address_cache"))
+    remote_vm.connect_uri = remote_uri
+    # Remote storage pool's instance
+    rsp = libvirt_storage.StoragePool(rvirsh)
+    if target_path:
+        create_dir_pool(rsp, pool_name, target_path)
 
     # Prepare local libvirt storage pool
     pvt = utlv.PoolVolumeTest(test, params)
@@ -158,15 +154,24 @@ def run(test, params, env):
     try:
         # Create storage pool for test
         pvt.pre_pool(pool_name, pool_type, target_path, emulated_img,
-                     emulated_size)
+                     image_size=emulated_size)
         logging.debug(lsp.pool_info(pool_name))
 
         # Maintain a single params for v2v to avoid duplicate parameters
         v2v_params = {"hostname": remote_ip, "username": username,
                       "password": remote_pwd, "hypervisor": remote_hypervisor,
                       "storage": pool_name, "network": network,
-                      "bridge": bridge, "target": "libvirt", "vms": vm_name,
-                      "netrc": esx_netrc, "input": input, "files": files}
+                      "bridge": bridge, "target": "libvirt", "main_vm": vm_name,
+                      "input": input, "files": files}
+        if vpx_dc:
+            v2v_params.update({"vpx_dc": vpx_dc})
+
+        if esx_ip:
+            v2v_params.update({"esx_ip": esx_ip})
+
+        if v2v_options:
+            v2v_params.update({"v2v_opts": v2v_options})
+
         try:
             result = utils_v2v.v2v_cmd(v2v_params)
             logging.debug(result)
@@ -178,7 +183,7 @@ def run(test, params, env):
         # Check v2v vm on local host
         # Update parameters for local hypervisor and vm
         logging.debug("XML info:\n%s", virsh.dumpxml(vm_name))
-        params['vms'] = vm_name
+        params['main_vm'] = vm_name
         params['target'] = "libvirt"
         vm_check = utils_v2v.LinuxVMCheck(test, params, env)
         try:
@@ -205,5 +210,8 @@ def run(test, params, env):
         except error.TestFail, detail:   # Make sure cleanup will be finished
             logging.warn(detail)
         if remote_hypervisor != "esx":
+            if remote_hypervisor == "xen":
+                utils.run("ssh-agent -k")
             rsp.delete_pool(pool_name)
-        rvirsh.close_session()
+        if rvirsh:
+            rvirsh.close_session()

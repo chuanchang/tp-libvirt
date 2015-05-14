@@ -47,16 +47,23 @@ def run(test, params, env):
     logging.info("Current vm list: %s" % vm.list())
 
     vm.import_from_export_domain(export_name, storage_name, cluster_name)
-    logging.info("The latest list: %s" % vm.list())
+    vm_list = vm.list()
+    logging.debug("The latest list: %s" % vm_list)
+    if vm_name not in vm_list:
+        raise error.TestFail("Faild to import '%s' to '%s'", vm_name, storage_name)    
 
     vm.start()
 
-    if vm.is_alive():
-        logging.info("The %s is alive" % vm_name)
+    if not vm.is_alive():
+        raise error.TestFail("The '%s' isn't running", vm_name)    
 
-    vm.suspend()
-    vm.resume()
-    vm.shutdown()
+    logging.info("The %s is alive" % vm_name)
+    
+#    vm.suspend()
+#    vm.resume()
+#    vm.shutdown()
 
-    if vm.is_dead():
-        logging.info("The %s is dead" % vm_name)
+#    if not vm.is_dead():
+#        raise error.TestFail("The '%s' is still running", vm_name)    
+
+#    logging.info("The %s is dead" % vm_name)
